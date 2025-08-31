@@ -14,19 +14,35 @@ from datetime import datetime
 from html import unescape as _unescape
 from urllib.parse import urlparse
 
+__version__ = "0.1.3"
+
+# Default maximum characters retained for extracted content (can be overridden per run)
+DEFAULT_MAX_CHARS = 8000
+
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
 
 # ---------- helpers ----------
 def _discover_url(html: str, passed: str) -> str:
+    """Best-effort discovery of canonical/source URL.
+
+    Tries (in order): explicit passed URL, <link rel=canonical>, og:url meta, <base href>.
+    Regexes are made order-agnostic regarding attribute ordering.
+    """
     if passed:
         return passed
-    m1 = re.search(r'<link[^>]+rel=["\']canonical["\'][^>]*href=["\']([^"\']+)["\']', html, re.I)
-    if m1: return m1.group(1)
+    # Two patterns to allow rel/href order variance
+    m1 = re.search(r'<link[^>]*?rel=["\']canonical["\'][^>]*?href=["\']([^"\']+)["\']', html, re.I)
+    if not m1:
+        m1 = re.search(r'<link[^>]*?href=["\']([^"\']+)["\'][^>]*?rel=["\']canonical["\']', html, re.I)
+    if m1:
+        return m1.group(1)
     m2 = re.search(r'<meta[^>]+property=["\']og:url["\'][^>]*content=["\']([^"\']+)["\']', html, re.I)
-    if m2: return m2.group(1)
+    if m2:
+        return m2.group(1)
     m3 = re.search(r'<base[^>]*href=["\']([^"\']+)["\']', html, re.I)
-    if m3: return m3.group(1)
+    if m3:
+        return m3.group(1)
     return ""
 
 def _extract_domain_site(u: str):
@@ -91,15 +107,9 @@ def _pick_section(html: str) -> str:
     return best
 
 def _clean(s: str) -> str:
-    """Remove HTML tags and trim/normalize whitespace.
-
-    Python's str does not have a trim() method (that's from JS); previous
-    version attempted a hasattr(str, 'trim') guard which is unnecessary and
-    could confuse linters. We always use strip() and also collapse internal
-    whitespace to a single space for cleaner output.
-    """
+    """Remove HTML tags, unescape entities, normalize whitespace."""
     text = re.sub(r"<[^>]*>", "", s or "")
-    # Collapse runs of whitespace (including newlines) to a single space
+    text = _unescape(text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
@@ -152,65 +162,129 @@ def _html_to_text(snippet: str) -> str:
     s = _unescape(s).strip()
     return s
 
-def _cap(s: str, n: int = 8000) -> str:
-    return (s[:n] + "...") if s and len(s) > n else (s or "")
+def _cap_chars(s: str, n: int | None) -> str:
+    if not s:
+        return ""
+    if n is None:
+        n = DEFAULT_MAX_CHARS
+    if n and n > 0 and len(s) > n:
+        return s[:n] + "..."
+    return s
+
+def _cap_wordsafe(s: str, n: int | None) -> str:
+    if not s:
+        return ""
+    if n is None:
+        n = DEFAULT_MAX_CHARS
+    if not (n and n > 0) or len(s) <= n:
+        return s
+    # Find last whitespace before limit - 1 to leave space for ellipsis
+    cut = s.rfind(" ", 0, max(0, n - 1))
+    if cut == -1 or cut < n * 0.5:  # fallback if no good breakpoint
+        cut = n
+    truncated = s[:cut].rstrip()
+    return truncated + " …"
 
 def _word_count(s: str) -> int:
     return len([w for w in (s or "").strip().split() if w])
 
 # ---------- node ----------
 class HTMLParseSync:
-    """
-    Parse HTML (no network), extract title/author/content + domain/site_name.
+    """Parse already-fetched HTML (no network) and extract article-style metadata.
+
     Inputs:
-      - html (STRING)
-      - url  (STRING, optional)
-    Outputs:
-      - json, title, content, author, domain, site_name (all STRING)
+      - html (STRING, required): Raw HTML markup.
+      - url  (STRING, optional): Original page URL (improves domain/site extraction).
+      - max_chars (INT, optional): Cap length of cleaned content (default 8000).
+
+    Outputs (all STRING): json, title, content, author, domain, site_name.
+    Design goals: zero external deps, resilient to malformed HTML, heuristic-based.
     """
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
-            "required": { "html": ("STRING", {"default": ""}) },
-            "optional": { "url":  ("STRING", {"default": ""}) },
+            "required": {"html": ("STRING", {"default": ""})},
+            "optional": {
+                "url": ("STRING", {"default": ""}),
+                "max_chars": ("INT", {"default": DEFAULT_MAX_CHARS, "min": 500, "max": 50000, "step": 500}),
+                "word_safe": ("BOOLEAN", {"default": True, "label": "Word-safe truncation"}),
+                "prompt_template": ("STRING", {"default": "", "multiline": True, "placeholder": "e.g. Summarize the article titled '{title}' from {domain}:\n\n{content}"}),
+            },
         }
 
-    RETURN_TYPES = ("STRING","STRING","STRING","STRING","STRING","STRING")
-    RETURN_NAMES = ("json","title","content","author","domain","site_name")
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING", "STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("json", "title", "content", "author", "domain", "site_name", "word_count", "prompt")
     FUNCTION = "run"
     CATEGORY = "Text/Parsing"
 
-    def run(self, html: str, url: str = ""):
+    def run(self, html: str, url: str = "", max_chars: int = DEFAULT_MAX_CHARS, word_safe: bool = True, prompt_template: str = ""):
         raw_html = html or ""
         discovered_url = _discover_url(raw_html, url or "")
         domain, site_name = _extract_domain_site(discovered_url)
 
         cleaned = _strip_blocks(raw_html)
         section = _pick_section(cleaned)
-        title   = _extract_title(cleaned)
-        author  = _extract_author(cleaned)
+        title = _extract_title(cleaned)
+        author = _extract_author(cleaned)
         content = _html_to_text(section)
-        content = _cap(content, 8000)
+
+        # Sanitize and clamp max_chars (avoid absurd values while allowing override)
+        try:
+            max_chars_int = int(max_chars)
+        except Exception:
+            max_chars_int = DEFAULT_MAX_CHARS
+        if max_chars_int < 0:
+            # disable capping
+            pass
+        else:
+            max_chars_int = max(100, min(max_chars_int, 100_000))
+            content = (_cap_wordsafe if word_safe else _cap_chars)(content, max_chars_int)
         wc = _word_count(content)
 
-        out = {
+        # Build placeholder context
+        content_snip = (_cap_wordsafe if word_safe else _cap_chars)(content, 1000)
+        placeholders = {
             "url": discovered_url or "unknown",
             "domain": domain,
             "site_name": site_name,
             "title": title,
             "content": content,
+            "content_snip": content_snip,
             "author": author,
             "word_count": wc,
+            "version": __version__,
             "extracted_at": datetime.utcnow().isoformat() + "Z",
         }
 
-        return (_json.dumps(out, ensure_ascii=False),
-                title or "",
-                content or "",
-                author or "",
-                domain or "",
-                site_name or "")
+        class _Safe(dict):
+            def __missing__(self, key):
+                # Leave unknown placeholder visibly unaltered
+                return '{' + key + '}'
+
+        formatted_prompt = ""
+        if prompt_template:
+            try:
+                formatted_prompt = prompt_template.format_map(_Safe(placeholders))
+            except Exception:
+                # Fallback: basic replacement using curly braces tokens
+                formatted_prompt = prompt_template
+                for k, v in placeholders.items():
+                    formatted_prompt = formatted_prompt.replace('{' + k + '}', str(v))
+
+        out = {**placeholders}
+        json_blob = _json.dumps(out, ensure_ascii=False)
+
+        return (
+            json_blob,
+            title or "",
+            content or "",
+            author or "",
+            domain or "",
+            site_name or "",
+            str(wc),
+            formatted_prompt or "",
+        )
 
 NODE_CLASS_MAPPINGS["HTMLParseSync"] = HTMLParseSync
 NODE_DISPLAY_NAME_MAPPINGS["HTMLParseSync"] = "HTML Parse (sync)"
